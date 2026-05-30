@@ -1,0 +1,7 @@
+obj-m       += akane.o
+akane-objs  := akane_core.o \
+               akane_memory.o \
+               akane_maps.o \
+               akane_hide.o \
+               akane_task_work.o
+ccflags-y   += -I$(src)

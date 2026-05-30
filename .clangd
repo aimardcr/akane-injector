@@ -1,0 +1,9 @@
+CompileFlags:
+  Add:
+    - --target=aarch64-linux-gnu
+    - -std=gnu89
+    - -D__KERNEL__
+    - -DMODULE
+    - -ferror-limit=0
+Diagnostics:
+  Suppress: '*'
