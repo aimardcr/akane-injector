@@ -74,20 +74,36 @@ typedef int (*access_process_vm_fn)(struct task_struct *tsk,
 				    void *buf, int len,
 				    unsigned int gup_flags);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+/*
+ * mprotect_fixup is resolved via kallsyms, so the prototype must match the
+ * target kernel exactly: 6.0 added the mmu_gather argument and 6.3 added the
+ * vma_iterator ahead of it. Android GKI ships 5.10/5.15/6.1/6.6, so the 6.1
+ * form (mmu_gather, no iterator) is a distinct case -- using the 6.6 seven-arg
+ * form there shifts every argument and mprotect_fixup returns -EINVAL.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 typedef int (*mprotect_fixup_fn)(struct vma_iterator *vmi,
 				 struct mmu_gather *tlb,
 				 struct vm_area_struct *vma,
 				 struct vm_area_struct **pprev,
 				 unsigned long start, unsigned long end,
 				 unsigned long newflags);
-typedef void (*tlb_gather_mmu_fn)(struct mmu_gather *tlb, struct mm_struct *mm);
-typedef void (*tlb_finish_mmu_fn)(struct mmu_gather *tlb);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+typedef int (*mprotect_fixup_fn)(struct mmu_gather *tlb,
+				 struct vm_area_struct *vma,
+				 struct vm_area_struct **pprev,
+				 unsigned long start, unsigned long end,
+				 unsigned long newflags);
 #else
 typedef int (*mprotect_fixup_fn)(struct vm_area_struct *vma,
 				 struct vm_area_struct **pprev,
 				 unsigned long start, unsigned long end,
 				 unsigned long newflags);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+typedef void (*tlb_gather_mmu_fn)(struct mmu_gather *tlb, struct mm_struct *mm);
+typedef void (*tlb_finish_mmu_fn)(struct mmu_gather *tlb);
 #endif
 
 static install_special_mapping_fn install_special_mapping_p;
@@ -131,10 +147,16 @@ call_mprotect_fixup(struct mm_struct *mm, struct vm_area_struct *vma,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 	struct mmu_gather tlb;
 	int ret;
-	VMA_ITERATOR(vmi, mm, start);
 
 	tlb_gather_mmu_p(&tlb, mm);
-	ret = mprotect_fixup_p(&vmi, &tlb, vma, pprev, start, end, newflags);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	{
+		VMA_ITERATOR(vmi, mm, start);
+		ret = mprotect_fixup_p(&vmi, &tlb, vma, pprev, start, end, newflags);
+	}
+#else
+	ret = mprotect_fixup_p(&tlb, vma, pprev, start, end, newflags);
+#endif
 	tlb_finish_mmu_p(&tlb);
 	return ret;
 #else
