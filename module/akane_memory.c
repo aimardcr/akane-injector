@@ -165,6 +165,41 @@ call_mprotect_fixup(struct mm_struct *mm, struct vm_area_struct *vma,
 #endif
 }
 
+/*
+ * Forbid-split workaround. Newer kernels' special_mapping_vmops set
+ * .may_split = special_mapping_split, which always returns -EINVAL, so PROTECT of
+ * a sub-range fails: mprotect_fixup must split the VMA at the range boundary.
+ * akane owns the mapping and its spec page array is pgoff-indexed, so the split
+ * is safe here, give akane's VMAs a private vm_ops copy with may_split cleared.
+ * The copy keeps every other hook (.fault/.name/...), so faulting, teardown and
+ * the /proc/<pid>/maps name are unaffected; only mremap-time special-mapping
+ * identity is lost, which a hidden payload never relies on. One copy shared by
+ * every akane VMA, like the static vmops it is cloned from.
+ *
+ * The hook was named .split before ~5.11 and carried no veto on special
+ * mappings, so on those kernels splitting already works and this is a no-op.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+static struct vm_operations_struct akane_special_vmops;
+static bool akane_special_vmops_ready;
+#endif
+
+static void akane_allow_vma_split(struct vm_area_struct *vma)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+	if (!vma->vm_ops)
+		return;
+	if (!akane_special_vmops_ready) {
+		akane_special_vmops = *vma->vm_ops;
+		akane_special_vmops.may_split = NULL;
+		akane_special_vmops_ready = true;
+	}
+	vma->vm_ops = &akane_special_vmops;
+#else
+	(void)vma;
+#endif
+}
+
 /* Target-mm address-space search. */
 
 /*
@@ -340,6 +375,9 @@ static long am_create(pid_t pid, u32 prot, unsigned long size,
 		ret = PTR_ERR(vma);
 		goto out_unlock;
 	}
+
+	/* So a later PROTECT can narrow a sub-range (see akane_allow_vma_split). */
+	akane_allow_vma_split(vma);
 
 	mmap_write_unlock(mm);
 
