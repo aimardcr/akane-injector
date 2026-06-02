@@ -81,6 +81,8 @@ typedef int (*mprotect_fixup_fn)(struct vma_iterator *vmi,
 				 struct vm_area_struct **pprev,
 				 unsigned long start, unsigned long end,
 				 unsigned long newflags);
+typedef void (*tlb_gather_mmu_fn)(struct mmu_gather *tlb, struct mm_struct *mm);
+typedef void (*tlb_finish_mmu_fn)(struct mmu_gather *tlb);
 #else
 typedef int (*mprotect_fixup_fn)(struct vm_area_struct *vma,
 				 struct vm_area_struct **pprev,
@@ -92,6 +94,10 @@ static install_special_mapping_fn install_special_mapping_p;
 static do_munmap_fn		  do_munmap_p;
 static access_process_vm_fn	  access_process_vm_p;
 static mprotect_fixup_fn	  mprotect_fixup_p;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+static tlb_gather_mmu_fn	  tlb_gather_mmu_p;
+static tlb_finish_mmu_fn	  tlb_finish_mmu_p;
+#endif
 
 static __nocfi struct vm_area_struct *
 call_install_special_mapping(struct mm_struct *mm,
@@ -127,9 +133,9 @@ call_mprotect_fixup(struct mm_struct *mm, struct vm_area_struct *vma,
 	int ret;
 	VMA_ITERATOR(vmi, mm, start);
 
-	tlb_gather_mmu(&tlb, mm);
+	tlb_gather_mmu_p(&tlb, mm);
 	ret = mprotect_fixup_p(&vmi, &tlb, vma, pprev, start, end, newflags);
-	tlb_finish_mmu(&tlb);
+	tlb_finish_mmu_p(&tlb);
 	return ret;
 #else
 	(void)mm;
@@ -675,6 +681,22 @@ int akane_memory_init(void)
 		pr_err("akane: memory: failed to resolve a required symbol\n");
 		return -ENOENT;
 	}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	/*
+	 * tlb_gather_mmu/tlb_finish_mmu exist in kallsyms but aren't
+	 * EXPORT_SYMBOL'd on every kernel, so resolve them too rather than
+	 * link directly (a direct reference fails insmod with -ENOENT).
+	 */
+	tlb_gather_mmu_p = (tlb_gather_mmu_fn)
+		akane_kallsyms_lookup("tlb_gather_mmu");
+	tlb_finish_mmu_p = (tlb_finish_mmu_fn)
+		akane_kallsyms_lookup("tlb_finish_mmu");
+	if (!tlb_gather_mmu_p || !tlb_finish_mmu_p) {
+		pr_err("akane: memory: failed to resolve tlb_gather_mmu/tlb_finish_mmu\n");
+		return -ENOENT;
+	}
+#endif
 	return 0;
 }
 
