@@ -1,25 +1,12 @@
 /*
- * akane runtime library.
+ * akane runtime library: dl* hook implementations + a payload registry the
+ * controller fills via mem_write before the payload's init_array runs.
  *
- * Loaded into the target process alongside each injected payload via
- * the same csoloader path. Provides dl* hook implementations + a small
- * payload registry the controller writes via mem_write before the
- * payload's init_array runs.
- *
- * Used so that libraries which introspect their own loaded image (Frida
- * gadget, etc.) can locate themselves via dl_iterate_phdr / dladdr even
- * though they were loaded outside bionic's solist.
- *
- * The runtime library has no init_array and no constructors -- it's
- * pure data + leaf-call hooks. The controller plants entries in the
- * registry directly, then patches the payload's GOT to redirect dl*
- * imports here. Calls from non-payload code keep their original GOT
- * pointing at libdl, so the runtime is invisible to unrelated dl*
- * introspection.
- *
- * The runtime's *own* GOT is left alone (we never patch this library's
- * GOT), so when our hooks forward to the real implementations they
- * reach bionic's solist as expected.
+ * The controller patches the payload's GOT to route dl* imports here, so
+ * libraries that introspect their own image (Frida gadget) can find
+ * themselves via dl_iterate_phdr / dladdr despite being outside bionic's
+ * solist. Non-payload code and this library's own GOT are untouched, so our
+ * hooks forwarding to the real implementations still reach solist normally.
  */
 
 #define _GNU_SOURCE
@@ -33,7 +20,7 @@
 
 #include "linker.h"
 
-/* Registry capacity. One entry per concurrent injection. */
+/* Registry capacity: one entry per concurrent injection. */
 #define AKANE_RT_MAX_PAYLOADS  16
 #define AKANE_RT_NAME_LEN      256
 
@@ -46,8 +33,7 @@ struct akane_rt_payload {
 	uint32_t           _pad1;
 };
 
-/* Controller's API surface (resolved via dynsym, written via
- * AKANE_IOC_MEM_WRITE before triggering exec on the payload). */
+/* Controller's API surface, resolved via dynsym and written via mem_write. */
 __attribute__((visibility("default")))
 struct akane_rt_payload g_akane_rt_payloads[AKANE_RT_MAX_PAYLOADS];
 
@@ -57,8 +43,7 @@ char g_akane_rt_names[AKANE_RT_MAX_PAYLOADS][AKANE_RT_NAME_LEN];
 __attribute__((visibility("default")))
 int32_t g_akane_rt_payload_count;
 
-/* Per-hook call counters. Diagnostic: lets the controller observe
- * whether the payload actually invoked each hook before its crash. */
+/* Per-hook call counters; the controller reads these as a diagnostic. */
 #define AKANE_RT_CC_DL_ITERATE_PHDR 0
 #define AKANE_RT_CC_DLADDR          1
 #define AKANE_RT_CC_DLOPEN          2
@@ -70,8 +55,7 @@ int32_t g_akane_rt_payload_count;
 __attribute__((visibility("default")))
 volatile uint64_t g_akane_rt_call_counts[AKANE_RT_CC_COUNT];
 
-/* Forward decls so akane_rt_dlsym can return their addresses for known
- * dl* names without depending on definition order. */
+/* Forward decls so akane_rt_dlsym can return these by name. */
 __attribute__((visibility("default")))
 int akane_rt_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *),
 			     void *data);
@@ -86,21 +70,12 @@ int akane_rt_dlclose(void *handle);
 __attribute__((visibility("default")))
 char *akane_rt_dlerror(void);
 
-/* ------------------------------------------------------------------ */
-/* Self-contained dlsym for RTLD_DEFAULT.
- *
- * The reason this exists: when a payload loaded by akane (i.e. outside
- * Bionic's loader) calls dlsym(RTLD_DEFAULT, name), Bionic looks up the
- * caller's soinfo via __builtin_return_address(0); since the payload
- * isn't in solist, no soinfo is found, and the call fails with
- * "undefined symbol: <name>" regardless of whether <name> exists.
- *
- * We sidestep that entirely: walk the linker's solist via
- * dl_iterate_phdr (which works fine -- it doesn't consult caller info),
- * parse each module's dynsym + strtab + hash, and return the first
- * matching symbol's address. Pure userspace ELF resolution, no Bionic
- * namespace dependency. */
-
+/*
+ * Self-contained dlsym for RTLD_DEFAULT. Bionic resolves RTLD_DEFAULT via the
+ * caller's soinfo (__builtin_return_address); an akane payload isn't in solist,
+ * so that always fails. Instead we walk solist via dl_iterate_phdr and parse
+ * each module's dynsym/strtab/hash ourselves.
+ */
 struct rt_dlsym_search {
 	const char *name;
 	void       *result;
@@ -172,7 +147,7 @@ static int rt_dlsym_iter_cb(struct dl_phdr_info *info, size_t size, void *data)
 	if (!symtab || !strtab)
 		return 0;
 
-	/* Try GNU hash first (modern bionic uses it almost exclusively). */
+	/* GNU hash first (modern bionic uses it almost exclusively). */
 	if (gnu_hash) {
 		uint32_t nbucket    = gnu_hash[0];
 		uint32_t symoffset  = gnu_hash[1];
@@ -230,8 +205,6 @@ try_elf_hash:
 	return 0;
 }
 
-/* RTLD_DEFAULT resolution that doesn't depend on Bionic knowing who's
- * calling. Returns NULL if the symbol isn't found in any module. */
 static void *rt_dlsym_default(const char *symbol)
 {
 	struct rt_dlsym_search s = { .name = symbol, .result = NULL };
@@ -239,9 +212,7 @@ static void *rt_dlsym_default(const char *symbol)
 	return s.result;
 }
 
-/* ------------------------------------------------------------------ */
-/* dl_iterate_phdr hook: emit each registered payload first, then
- * forward to the real implementation. */
+/* dl_iterate_phdr hook: emit each registered payload, then forward to libc. */
 __attribute__((visibility("default")))
 int akane_rt_dl_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *),
 			     void *data)
@@ -312,9 +283,8 @@ void *akane_rt_dlsym(void *handle, const char *symbol)
 	if (!symbol)
 		return dlsym(handle, symbol);
 
-	/* Known dl* names short-circuit to our hook addresses regardless
-	 * of handle, so callers that cache the resolved pointer (Gum-style)
-	 * route through us on subsequent calls. */
+	/* Known dl* names resolve to our hooks, so callers that cache the
+	 * pointer (Gum-style) keep routing through us. */
 	if (!strcmp(symbol, "dl_iterate_phdr"))
 		return (void *)akane_rt_dl_iterate_phdr;
 	if (!strcmp(symbol, "dladdr"))
@@ -328,12 +298,8 @@ void *akane_rt_dlsym(void *handle, const char *symbol)
 	if (!strcmp(symbol, "dlerror"))
 		return (void *)akane_rt_dlerror;
 
-	/* For RTLD_DEFAULT / RTLD_NEXT, Bionic would consult the caller's
-	 * soinfo to pick a namespace; payloads loaded by akane have no
-	 * soinfo, so that path always fails. Resolve in user space by
-	 * walking solist via dl_iterate_phdr and parsing each module's
-	 * dynsym. Falls through to libc dlsym only if our resolver missed
-	 * it (e.g. weak symbol fallbacks libc handles internally). */
+	/* RTLD_DEFAULT/RTLD_NEXT need caller soinfo, which akane payloads lack;
+	 * resolve ourselves and fall through to libc only on a miss. */
 	if (handle == RTLD_DEFAULT || handle == RTLD_NEXT) {
 		void *r = rt_dlsym_default(symbol);
 		if (r)
@@ -357,14 +323,9 @@ char *akane_rt_dlerror(void)
 	return dlerror();
 }
 
-/* Splice each registered payload into bionic's solist. Called by the
- * worker thread (via the bootstrap stub) before the payload's
- * init_array runs, when the controller passed --register-to-solist.
- *
- * Iterates g_akane_rt_payloads (populated by the controller via
- * mem_write before exec) and registers each entry. The payload's
- * library appears thereafter as a real loaded module to anything that
- * walks bionic's solist (Frida gum, etc.). */
+/* Splice each registered payload into bionic's solist so it appears as a real
+ * loaded module. Called by the bootstrap worker before init_array, under
+ * --register-to-solist. */
 __attribute__((visibility("default")))
 int akane_rt_linker_register(void)
 {

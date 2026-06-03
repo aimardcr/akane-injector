@@ -1,49 +1,26 @@
 /*
- * akane bootstrap stub.
+ * akane bootstrap stub. Lives in the controller binary; mem_written into a
+ * target-side boot region so any .so injects unmodified. Position-independent:
+ * no GOT/PLT/globals; everything reached through the saved_state ptr in x0.
  *
- * Lives in akane_injector (the controller binary), not in the payload.
- * The injector mem_writes these bytes into a small target-side "boot
- * region" allocated separately from the user's .so, so any .so can be
- * injected without modification.
+ * It spawns a worker thread to run .init_array (so a blocking constructor
+ * can't ANR the host), sets the done flag, restores regs, and branches back
+ * to the original pc. The controller detaches (not frees) the region because
+ * the worker keeps executing from this same blob.
  *
- * Position-independent: no GOT, no PLT, no global accesses; everything
- * is reached through the saved_state pointer in x0.
+ * Saved-state buffer (must match the controller):
+ *   off 0..240  -> regs[0..30] (x0..x30)
+ *   off 248     -> sp
+ *   off 256     -> pc
+ *   off 264     -> pstate
+ *   off 384     -> init_array_addr (0 = none)
+ *   off 392     -> init_array_count
+ *   off 400     -> pthread_create_addr (target VA, 0 = skip)
+ *   off 408     -> tid storage (written by pthread_create)
+ *   off 424     -> linker_register_addr (0 = skip)
+ *   off 512     -> done flag (bootstrap writes 1; controller polls + detaches)
  *
- * Saved-state buffer (must match exec.c):
- *   off 0   .. 240  -> regs[0..30]   (x0..x30)
- *   off 248         -> sp
- *   off 256         -> pc
- *   off 264         -> pstate
- *   ... pt_regs tail
- *   off 384         -> init_array_addr  (0 = none)
- *   off 392         -> init_array_count
- *   off 400         -> pthread_create_addr (target VA, 0 = skip)
- *   off 408         -> tid storage (written by pthread_create)
- *   off 512         -> done flag (bootstrap writes 1 here just before
- *                      branching back; controller polls and detaches the
- *                      boot region once it sees the flag set).
- *
- * Boot blob layout (one RX page):
- *   akane_bootstrap_start ... bootstrap code
- *   akane_init_runner     ... worker that walks .init_array
- *   akane_bootstrap_end
- *
- * The dl* hooks that were here previously have moved to a separate
- * runtime library (libakane_runtime.so) injected alongside the payload.
- * The bootstrap stub is back to its minimum: hijack-resume + worker
- * thread spawn for init_array.
- *
- * Flow:
- *   1. pthread_create(&tid, NULL, init_runner, &saved_state[384])
- *      Worker thread iterates init_array off the hijacked thread so a
- *      blocking constructor never ANRs the host app.
- *   2. Set done flag to 1.
- *   3. Restore syscall-return-preserved regs (x0, x19..x30, sp) and
- *      branch back to original pc.
- *
- * The boot region must outlive the worker thread (init_runner reads
- * from saved_state and executes from this same blob), so the controller
- * detaches the region instead of unmapping it.
+ * Boot blob layout (one RX page): bootstrap code, then akane_init_runner.
  */
 
 .section .text.akane_bootstrap, "ax"
@@ -86,8 +63,7 @@ akane_bootstrap_start:
 	ldp	x27, x28, [x0, #216]
 	ldp	x29, x30, [x0, #232]
 
-	// Signal completion. Controller polls this byte and detaches the
-	// boot region once it's set, so no [akane:N] handle remains.
+	// Signal completion; controller polls this byte and detaches the region.
 	mov	w9, #1
 	str	w9, [x0, #512]
 
@@ -110,9 +86,8 @@ akane_init_runner:
 	stp	x21, x22, [sp, #32]
 	mov	x29, sp
 
-	// Optional: register payload in bionic's solist BEFORE running
-	// init_array, so libraries that introspect via solist (Frida) see
-	// the gadget when their constructors call detect_location.
+	// Optional: register payload in solist before init_array, so solist
+	// introspectors (Frida) see the gadget during constructors.
 	ldr	x9, [x0, #40]                   // linker_register_addr
 	cbz	x9, 7f
 	mov	x21, x0                         // preserve worker arg

@@ -11,8 +11,7 @@
 #include "linker.h"
 #include "elf_util.h"
 
-/* Walk all loaded deps for an exported symbol, return its target VA.
- * Skips deps that haven't loaded successfully. */
+/* Find an exported symbol across all loaded deps; returns its target VA. */
 static uint64_t resolve_dep_symbol(const struct linker *lk, const char *name)
 {
 	for (int i = 0; i < lk->dep_count; i++) {
@@ -24,9 +23,8 @@ static uint64_t resolve_dep_symbol(const struct linker *lk, const char *name)
 	return 0;
 }
 
-/* Walk PT_DYNAMIC for the .dynstr range. Returns 0 size if the dynamic
- * section is missing or DT_STRTAB/DT_STRSZ couldn't be parsed. addr is
- * the target-side VA of the .dynstr block. */
+/* Target-side VA + size of the .dynstr block (from PT_DYNAMIC DT_STRTAB/STRSZ);
+ * 0 size if absent. */
 static void find_dynstr_target_range(struct csoloader_elf *img,
                                      uint64_t *addr_out, uint64_t *size_out)
 {
@@ -60,11 +58,8 @@ static void find_dynstr_target_range(struct csoloader_elf *img,
 	*size_out = strsz;
 }
 
-/* Locate the first PT_NOTE segment carrying a .note.gnu.build-id entry.
- * The note layout is 32-bit namesz + 32-bit descsz + 32-bit type, then
- * name (padded to 4) + desc (padded to 4). type=NT_GNU_BUILD_ID (3),
- * name="GNU\0". On hit, returns the target-side VA covering the whole
- * note record (header + name + desc). */
+/* Target-side VA + size of the .note.gnu.build-id record in PT_NOTE
+ * (note layout: namesz, descsz, type, then 4-padded name + desc). */
 #ifndef NT_GNU_BUILD_ID
 #define NT_GNU_BUILD_ID 3
 #endif
@@ -108,9 +103,8 @@ static void find_buildid_target_range(struct csoloader_elf *img,
 	}
 }
 
-/* Find the target VA of `img`'s GOT slot for the given JMPREL symbol.
- * Walks PT_DYNAMIC -> DT_JMPREL/DT_PLTRELSZ, matches symbol name in the
- * dynamic symbol table. Returns 0 if not found. */
+/* Target VA of `img`'s GOT slot for a JMPREL symbol (PT_DYNAMIC DT_JMPREL),
+ * or 0 if not found. */
 static uint64_t find_jumpslot_target_va(struct csoloader_elf *img, const char *name)
 {
 	if (!img || !img->header) return 0;
@@ -200,8 +194,8 @@ int akane_payload_load(struct akane_backend *backend, const char *so_path,
 		DETAIL("init_array: none");
 	}
 
-	/* Resolve pthread_create in target's libc so the bootstrap can run
-	 * .init_array on a fresh thread instead of the hijacked one. */
+	/* pthread_create lets the bootstrap run .init_array on a fresh thread
+	 * instead of the hijacked one. */
 	if (out->init_array_count > 0) {
 		out->pthread_create_target = resolve_dep_symbol(&lib.linker, "pthread_create");
 		if (!out->pthread_create_target) {
@@ -213,10 +207,8 @@ int akane_payload_load(struct akane_backend *backend, const char *so_path,
 		       (unsigned long long)out->pthread_create_target);
 	}
 
-	/* GOT slots for the symbols we plan to redirect to the runtime
-	 * library's hooks. Slot may be 0 if the payload doesn't import that
-	 * function -- that's fine, the patcher only patches the ones it
-	 * actually uses. */
+	/* GOT slots to redirect to the runtime hooks; 0 means the payload
+	 * doesn't import that function and the patcher skips it. */
 	out->got_dl_iterate_phdr = find_jumpslot_target_va(lib.img, "dl_iterate_phdr");
 	out->got_dladdr          = find_jumpslot_target_va(lib.img, "dladdr");
 	out->got_dlopen          = find_jumpslot_target_va(lib.img, "dlopen");
@@ -224,17 +216,15 @@ int akane_payload_load(struct akane_backend *backend, const char *so_path,
 	out->got_dlclose         = find_jumpslot_target_va(lib.img, "dlclose");
 	out->got_dlerror         = find_jumpslot_target_va(lib.img, "dlerror");
 
-	/* Snapshot phdr table + map size for the registry entry. The runtime
-	 * hook uses these to synthesize dl_phdr_info / Dl_info. */
+	/* phdr table for the registry; the runtime synthesizes dl_phdr_info from it. */
 	if (lib.img->header && lib.img->header->e_phoff && lib.img->header->e_phnum) {
 		out->phdr_target = (uint64_t)((uintptr_t)lib.img->target_base
 		                              + lib.img->header->e_phoff);
 		out->phnum = lib.img->header->e_phnum;
 	}
 
-	/* Snapshot metadata ranges for the post-init deep ELF strip. Computed
-	 * here while we still own the loader handle (lib.img->base is the
-	 * controller-side mirror). */
+	/* Metadata ranges for the post-init strip, computed while we still own
+	 * the loader handle. */
 	find_dynstr_target_range (lib.img, &out->strip_dynstr_addr,  &out->strip_dynstr_size);
 	find_buildid_target_range(lib.img, &out->strip_buildid_addr, &out->strip_buildid_size);
 

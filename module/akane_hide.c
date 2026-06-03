@@ -1,20 +1,12 @@
 /*
- * akane hide: make things invisible to non-root callers.
+ * akane hide: make things invisible to non-root callers. A registry of
+ * targets (paths, module names, ports) drives kretprobes that filter files,
+ * /proc/modules + getdents64, /proc/net/{tcp,udp}{,6}, and memory
+ * introspection (/proc/<pid>/{mem,smaps,pagemap} + process_vm_* + mincore).
  *
- * A registry of targets (paths, module names, ports) drives a set of
- * kretprobes that filter what those callers can observe:
- *
- *	registry	the target lists + ADD/REMOVE ioctls
- *	files		open()/stat()/access()/readlink() of hidden paths
- *	modules		/proc/modules + getdents64 module-name filtering
- *	net		/proc/net/{tcp,tcp6,udp,udp6} port-line filtering
- *	memory		/proc/<pid>/{mem,smaps,pagemap} + process_vm_* +
- *			mincore, gated by the per-VMA HIDE_FROM_MEMORY flag
- *
- * Every hook short-circuits when the caller is root, so akane's own
- * (root) controller and any root tool keep working; the target app, which
- * is always non-root on Android, is what gets filtered. Each hook attaches
- * best-effort: a failed registration is logged but never fails the module.
+ * Every hook short-circuits for root, so the controller keeps working while
+ * the (non-root) target app is filtered. Each hook attaches best-effort: a
+ * failed registration is logged but never fails the module.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -37,14 +29,10 @@
 
 #include "akane.h"
 
-/* ====================================================================
- * Registry: one list per kind, so each lookup is O(targets-of-that-kind).
- *
- * Path matches are exact OR directory-prefix: "/sys/module/akane" also
- * hides "/sys/module/akane/sections". Defaults seeded at init hide akane
- * itself out of the box.
- * ==================================================================== */
-
+/*
+ * Registry: one list per kind. Path matches are exact OR directory-prefix
+ * ("/sys/module/akane" also hides "/sys/module/akane/sections").
+ */
 struct hide_entry {
 	struct list_head link;
 	u32		 kind;
@@ -209,7 +197,7 @@ static long hide_ioctl(unsigned long arg, bool add)
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
 
-	req.name[sizeof(req.name) - 1] = '\0';		/* defensive */
+	req.name[sizeof(req.name) - 1] = '\0';
 
 	if (add)
 		return hide_add(req.kind, (const char *)req.name, req.port);
@@ -265,15 +253,11 @@ static void hide_registry_exit(void)
 	spin_unlock(&reg_lock);
 }
 
-/* ====================================================================
- * Files: hidden paths return -ENOENT.
- *
- * do_filp_open receives a kernel `struct filename *` already; the
- * path-based syscalls use the stable `long fn(struct pt_regs *)` entry
- * form, so the filename user-pointer is at user_regs->regs[1] across
- * kernel versions.
- * ==================================================================== */
-
+/*
+ * Files: hidden paths return -ENOENT. do_filp_open gets a kernel
+ * `struct filename *` in x1; the syscall entries use the `fn(struct pt_regs *)`
+ * form, so the filename user-pointer is at user_regs->regs[1].
+ */
 #define HIDE_PATH_PEEK	256
 
 struct hide_open_data {
@@ -417,15 +401,11 @@ static void hide_files_exit(void)
 		unregister_kretprobe(&readlinkat_kp);
 }
 
-/* ====================================================================
+/*
  * Modules: drop hidden module names from /proc/modules and getdents64.
- *
- * m_show emits one /proc/modules line; we snapshot seq_file->count before
- * the call and rewind it on return if the line begins with a hidden
- * "<name> " token. The strict prefix avoids false hits in unrelated
- * seq_file users that happen to also be named m_show.
- * ==================================================================== */
-
+ * m_show emits one /proc/modules line; we snapshot seq_file->count before the
+ * call and rewind it on return if the line's first token is a hidden name.
+ */
 struct hide_mshow_data {
 	struct seq_file *m;
 	size_t		 count_before;
@@ -515,7 +495,7 @@ static int getdents64_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 
 	if (!d->intercept || ret <= 0)
 		return 0;
-	if (ret > 16384)			/* avoid a huge GFP_ATOMIC alloc */
+	if (ret > 16384)			/* cap the GFP_ATOMIC alloc */
 		return 0;
 
 	kbuf = kmalloc(ret, GFP_ATOMIC);
@@ -584,16 +564,11 @@ static void hide_modules_exit(void)
 		unregister_kretprobe(&m_show_kp);
 }
 
-/* ====================================================================
- * Net: drop /proc/net/{tcp,udp}{,6} lines whose local or remote port is
- * hidden. The seq_show functions print one line as
- *
- *	<sl>: <local>:<lport> <rem>:<rport> <state> ...
- *
- * with ports as exactly 4 hex chars; we use the same count-rewind trick
- * as m_show, scanning the emitted bytes for ":HHHH" tokens.
- * ==================================================================== */
-
+/*
+ * Net: drop /proc/net/{tcp,udp}{,6} lines whose local or remote port is hidden.
+ * Ports print as exactly 4 hex chars; same count-rewind trick as m_show,
+ * scanning the emitted bytes for ":HHHH" tokens.
+ */
 static bool is_hex_char(char c)
 {
 	return (c >= '0' && c <= '9') ||
@@ -616,10 +591,7 @@ static u16 parse_hex4(const char *p)
 	return v;
 }
 
-/*
- * Scan line[0..len) for ":HHHH" tokens (exactly 4 hex chars followed by a
- * non-hex char) and ask `match` whether the port should be hidden.
- */
+/* Scan for ":HHHH" port tokens and ask `match` whether to hide. */
 static bool line_has_hidden_port(const char *line, size_t len,
 				 bool (*match)(u16))
 {
@@ -744,19 +716,12 @@ static void hide_net_exit(void)
 		unregister_kretprobe(&udp6_kp);
 }
 
-/* ====================================================================
- * Memory: hide HIDE_FROM_MEMORY-flagged akane VMAs from non-root
- * introspection -- both cross-process (an attacker reads the target) and
- * self-introspection from inside the target. "Flagged" is decided by the
- * AKANE_MAPS_HIDE_FROM_MEMORY bit on the allocation, looked up through
- * akane_maps.c's address helpers.
- * ==================================================================== */
-
 /*
- * True if any page in [start, start+len) lands in a hidden akane
- * allocation. Cheap: allocations are page-aligned and the handle list is
- * short (one entry per live injection), so the per-page check is O(handles).
+ * Memory: hide HIDE_FROM_MEMORY-flagged akane VMAs from non-root
+ * introspection, both cross-process and from inside the target.
  */
+
+/* True if any page in [start, start+len) lands in a hidden akane allocation. */
 static bool range_hits_hidden(struct mm_struct *mm,
 			      unsigned long start, unsigned long len)
 {
@@ -772,9 +737,8 @@ static bool range_hits_hidden(struct mm_struct *mm,
 }
 
 /*
- * access_remote_vm (arm64: x0=mm, x1=addr, x3=len) backs reads of
- * /proc/<pid>/mem. Block by forcing a 0-byte return, which the reader
- * sees as EOF.
+ * access_remote_vm (arm64: x0=mm, x1=addr, x3=len) backs /proc/<pid>/mem
+ * reads. Block by forcing a 0-byte return, which the reader sees as EOF.
  */
 struct mem_hide_data {
 	bool intercept;
@@ -814,10 +778,9 @@ static struct kretprobe access_remote_vm_kp = {
 };
 
 /*
- * process_vm_readv / process_vm_writev. The syscall pt_regs is at
- * regs->regs[0]; from it x0=pid, x3=remote iovec, x4=remote iovcnt. If any
- * remote_iov entry overlaps a hidden VMA we fail the whole syscall with
- * -EFAULT. Coarse, but most readers succeed or fail in full anyway.
+ * process_vm_readv / process_vm_writev (syscall pt_regs at x0; from it
+ * x0=pid, x3=remote iovec, x4=iovcnt). Fail the whole syscall with -EFAULT
+ * if any remote_iov entry overlaps a hidden VMA.
  */
 struct pvr_hide_data {
 	bool intercept;
@@ -896,9 +859,8 @@ DEFINE_PVR_KRETPROBE(pvr_readv_kp);
 DEFINE_PVR_KRETPROBE(pvr_writev_kp);
 
 /*
- * show_smap (arm64: x0=seq_file, x1=vm_area_struct) emits a
- * /proc/<pid>/smaps stanza. Rewind seq_file->count on return if the VMA
- * is hidden.
+ * show_smap (arm64: x0=seq_file, x1=vm_area_struct) emits a /proc/<pid>/smaps
+ * stanza. Rewind seq_file->count on return if the VMA is hidden.
  */
 struct smap_hide_data {
 	struct seq_file *m;
@@ -944,10 +906,8 @@ static struct kretprobe show_smap_kp = {
 
 /*
  * pagemap_read (arm64: x0=file, x2=count, x3=ppos). Each PTE is 8 bytes at
- * file offset (vaddr/PAGE_SIZE)*8, so we recover the VA range from
- * (*ppos, count). file->private_data is the target's mm_struct on the
- * kernels we target. If any page in the range is hidden, return 0 (short
- * read) and the reader sees a truncated pagemap.
+ * file offset (vaddr/PAGE_SIZE)*8, so we recover the VA range from (*ppos,
+ * count); file->private_data is the target's mm. Hidden page -> return 0.
  */
 struct pagemap_hide_data {
 	bool intercept;
@@ -1000,9 +960,8 @@ static struct kretprobe pagemap_read_kp = {
 };
 
 /*
- * mincore (arm64 syscall regs: x0=start, x1=len). Returning -ENOMEM for a
- * range overlapping a hidden VMA is the legitimate "not mapped" response,
- * so callers can't distinguish it from akane hiding the range.
+ * mincore (arm64 syscall regs: x0=start, x1=len). -ENOMEM for a range over a
+ * hidden VMA is the normal "not mapped" response, so it's indistinguishable.
  */
 struct mincore_hide_data {
 	bool intercept;
@@ -1098,11 +1057,7 @@ static void hide_memory_exit(void)
 		unregister_kretprobe(&mincore_kp);
 }
 
-/* ====================================================================
- * Brand init / exit. The registry must come up first (it seeds the
- * defaults the hooks consult); the hooks themselves are best-effort.
- * ==================================================================== */
-
+/* Registry comes up first (it seeds the defaults the hooks consult). */
 int akane_hide_init(void)
 {
 	int ret = hide_registry_init();

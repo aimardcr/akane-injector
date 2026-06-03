@@ -1,10 +1,7 @@
 #!/bin/sh
-# Build the akane kernel module against a specific ddk-min kernel variant,
-# then copy the resulting .ko to $OUT/module/$KERNEL/akane.ko.
-#
-# Per-kernel scratch dirs live at module/build-$KERNEL so parallel builds
-# don't stomp on each other. Failure to build one variant doesn't abort
-# the matrix -- caller treats a missing artifact as "this kernel skipped."
+# Build akane.ko against a specific ddk-min kernel variant into
+# $OUT/module/$KERNEL/. Per-kernel scratch dirs (module/build-$KERNEL) keep
+# parallel builds isolated; a failed variant is skipped, not fatal.
 set -e
 
 OUT="$1"

@@ -3,14 +3,8 @@
 
 #include <stdio.h>
 
-/* All injector output goes to stderr.
- *   INFO:   top-level step ("loading X into pid Y", "injected via Z").
- *   DETAIL: indented sub-line for addresses, sizes, counts.
- *   ERR:    failure path with "error: " prefix.
- *
- * akane_log_verbose only toggles CSOLoader's internal chatter (relocations,
- * segments, etc.) -- the injector's own output stays the same regardless.
- * Owned by main.c. */
+/* All output goes to stderr. akane_log_verbose (owned by main.c) only toggles
+ * CSOLoader's chatter; the injector's own INFO/DETAIL/ERR are unaffected. */
 extern int akane_log_verbose;
 
 #define INFO(fmt, ...)   do { fprintf(stderr, fmt "\n", ##__VA_ARGS__); } while (0)

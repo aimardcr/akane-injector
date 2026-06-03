@@ -25,14 +25,9 @@ static int sys_finit_module(int fd, const char *params, int flags)
 	return (int)syscall(__NR_finit_module, fd, params, flags);
 }
 
-/* Parse uname.release for the kernel major.minor + the embedded "-androidN-"
- * compat tag. Example release strings:
- *   "5.10.236-android12-9-00020-gf997514b333d-ab13743839"  -> (12, 5, 10)
- *   "6.1.0-android14-..."                                  -> (14, 6, 1)
- *
- * If a field can't be parsed, the corresponding *_out is left untouched
- * (caller should pre-zero). Returns 0 if at least kernel major+minor were
- * parsed, -1 otherwise. */
+/* Parse uname.release (e.g. "5.10.236-android12-...") for kernel major.minor
+ * and the -androidN tag. Unparsed fields are left untouched; returns 0 if at
+ * least major.minor parsed. */
 static int parse_kernel_release(const char *rel,
                                 int *android_out,
                                 int *major_out, int *minor_out)
@@ -52,11 +47,8 @@ static int parse_kernel_release(const char *rel,
 	return 0;
 }
 
-/* Returns the best-matching blob, or NULL if nothing applies.
- * Priority:
- *   1. Exact (android, kernel major.minor) match.
- *   2. Same kernel major.minor, any android.
- *   3. NULL. */
+/* Best-matching blob: exact (android, major.minor), else same major.minor any
+ * android, else NULL. */
 static const struct akane_ko_blob *select_blob(int android, int kmaj, int kmin)
 {
 	const struct akane_ko_blob *fallback = NULL;
@@ -122,8 +114,7 @@ int akane_module_ensure_loaded(void)
 		return -1;
 	}
 
-	/* memfd gives us a kernel-backed fd with no /tmp / /data artifact.
-	 * finit_module() reads the module from any fd, including a memfd. */
+	/* memfd: a kernel-backed fd with no filesystem artifact for finit_module. */
 	int fd = sys_memfd_create("akane.ko", 0);
 	if (fd < 0) {
 		ERR("memfd_create: %s", strerror(errno));
@@ -145,8 +136,7 @@ int akane_module_ensure_loaded(void)
 
 	if (sys_finit_module(fd, "", 0) < 0) {
 		if (errno == EEXIST) {
-			/* Race: someone loaded it between our access() check
-			 * and finit_module. Treat as success if /dev/akane exists. */
+			/* Loaded concurrently; success if /dev/akane now exists. */
 			close(fd);
 			return access(DEV_AKANE, F_OK) == 0 ? 0 : -1;
 		}
@@ -160,14 +150,14 @@ int akane_module_ensure_loaded(void)
 	}
 	close(fd);
 
-	/* devtmpfs may need a tick to publish /dev/akane after module init. */
+	/* devtmpfs may need a tick to publish /dev/akane after init (1s timeout). */
 	for (int i = 0; i < 50; i++) {
 		if (access(DEV_AKANE, F_OK) == 0) {
 			DETAIL("loaded akane.ko (%zu bytes from '%s')",
 			       blob_size, b->label);
 			return 0;
 		}
-		usleep(20000);   /* 20ms x 50 = 1s timeout */
+		usleep(20000);
 	}
 	ERR("module loaded but " DEV_AKANE " never appeared");
 	return -1;

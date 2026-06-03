@@ -1,22 +1,10 @@
 /*
- * akane_runtime: bionic linker introspection.
- *
- * Phase 1: read-only discovery.
- *   1. Find the dynamic linker (`/.../linker64`) via /proc/self/maps,
- *      capture its load_bias (first segment start).
- *   2. mmap the linker file and walk its .symtab / .dynsym to find
- *      the well-known internal symbols:
- *          __dl__ZL6solist       -> head pointer (variable)
- *          __dl__ZL6somain       -> main exe's soinfo (variable)
- *          __dl__ZL6sonext       -> tail pointer (variable)
- *          __dl__ZL10g_dl_mutex  -> linker mutex (variable)
- *      Add load_bias to convert to runtime VA.
- *   3. Read somain's soinfo and find the `base` offset by scanning
- *      candidate qwords; the right one points at an ELF mapping in
- *      our address space (verified via /proc/self/maps).
- *
- * No mutations yet -- this is the safe checkpoint where the controller
- * mem_reads g_akane_linker_state and we verify our discovery is sane.
+ * akane_runtime: bionic linker introspection. akane_linker_discover() locates
+ * the linker via /proc/self/maps, parses its .symtab/.dynsym for the internal
+ * solist/somain/sonext/g_dl_mutex symbols, then recovers the soinfo field
+ * offsets heuristically by matching known values. akane_linker_register_payload()
+ * then splices a synthetic soinfo into solist. Offsets are version-independent
+ * because they're discovered, not hardcoded.
  */
 
 #define _GNU_SOURCE
@@ -36,12 +24,8 @@
 
 #include "linker.h"
 
-/* Persistent storage for our synthetic soinfo and its path string.
- * Sized to comfortably hold any bionic soinfo (typical max ~0xe0 bytes
- * across all Android versions with bias around 0xd0). The buffers live
- * in this library's BSS; the runtime's mapping persists for the
- * target process's lifetime, so once spliced into solist these are
- * stable references for any introspection that follows. */
+/* Synthetic soinfo + path string, in BSS (256 holds any bionic soinfo, max
+ * ~0xe0). The runtime mapping outlives the target, so these stay valid in solist. */
 static uint8_t g_akane_syn_soinfo[256] __attribute__((aligned(8)));
 static char    g_akane_syn_name[256];
 static bool    g_akane_syn_active;
@@ -49,9 +33,7 @@ static bool    g_akane_syn_active;
 __attribute__((visibility("default")))
 struct akane_linker_state g_akane_linker_state;
 
-/* ------------------------------------------------------------------ */
-/* /proc/self/maps walking */
-
+/* /proc/self/maps walking. */
 typedef bool (*akl_map_cb)(uint64_t start, uint64_t end, int prot,
 			   const char *path, void *data);
 
@@ -79,9 +61,7 @@ static void akl_iter_maps(akl_map_cb cb, void *data)
 	fclose(fp);
 }
 
-/* ------------------------------------------------------------------ */
-/* Address validation: is `addr` in any readable mapping? */
-
+/* Is `addr` in any readable mapping? */
 struct akl_addr_in_range_ctx {
 	uint64_t addr;
 	bool     found;
@@ -106,9 +86,7 @@ static bool akl_addr_readable(uint64_t addr)
 	return c.found;
 }
 
-/* ------------------------------------------------------------------ */
 /* Find the bionic linker mapping. */
-
 struct akl_find_linker_ctx {
 	char     path[256];
 	uint64_t load_bias;
@@ -140,10 +118,8 @@ static bool akl_find_linker_cb(uint64_t start, uint64_t end, int prot,
 	return false;
 }
 
-/* ------------------------------------------------------------------ */
-/* ELF symbol lookup: search .symtab first (local symbols live there),
- * fall back to .dynsym. Returns symbol's st_value (file vaddr), or 0. */
-
+/* ELF symbol lookup: .symtab first (locals live there), then .dynsym.
+ * Returns st_value (file vaddr), or 0. */
 static uint64_t akl_elf_find_symbol_in_section(const uint8_t *elf,
 					       const ElfW(Shdr) *sym_shdr,
 					       const char *strtab,
@@ -185,9 +161,7 @@ static uint64_t akl_elf_find_symbol(const uint8_t *elf, size_t elf_size,
 	return 0;
 }
 
-/* ------------------------------------------------------------------ */
 /* Page protection lookup + RW write helper. */
-
 struct akl_prot_ctx {
 	uint64_t addr;
 	int      prot;
@@ -214,8 +188,8 @@ static int akl_get_prot(uint64_t addr)
 	return c.found ? c.prot : -1;
 }
 
-/* Write a 64-bit value to an address that may live in a read-only page
- * (e.g. linker .data after RELRO). mprotects to RW, writes, restores. */
+/* Write a qword to an address that may be RO (linker .data after RELRO):
+ * mprotect to RW, write, restore. */
 static bool akl_write_qword(uint64_t addr, uint64_t value)
 {
 	long page = sysconf(_SC_PAGE_SIZE);
@@ -241,9 +215,6 @@ static bool akl_write_qword(uint64_t addr, uint64_t value)
 
 	return true;
 }
-
-/* ------------------------------------------------------------------ */
-/* Public: run discovery. */
 
 bool akane_linker_discover(void)
 {
@@ -335,9 +306,7 @@ bool akane_linker_discover(void)
 	memcpy(st->somain_buf, (const void *)(uintptr_t)ref_si,
 	       sizeof(st->somain_buf));
 
-	/* Step 4: find `base` offset. Each non-zero qword that points at
-	 * a readable mapping whose first 4 bytes are ELFMAG is a candidate;
-	 * accept the first one. */
+	/* Step 4: `base` offset = first qword pointing at an ELFMAG mapping. */
 	uint64_t found_base = 0;
 	for (size_t i = 0; i + 8 <= sizeof(st->somain_buf); i += 8) {
 		uint64_t cand;
@@ -357,10 +326,8 @@ bool akane_linker_discover(void)
 	if (!found_base)
 		return false;
 
-	/* Step 5: compute expected values from the ELF at `found_base`,
-	 * then scan the soinfo buffer for matches. Each field is filled
-	 * only on the first match so a value coincidence elsewhere doesn't
-	 * mask the real field. */
+	/* Step 5: compute expected values from the ELF at `found_base`, then
+	 * scan the soinfo for matches (first match wins per field). */
 	const ElfW(Ehdr) *eh = (const ElfW(Ehdr) *)(uintptr_t)found_base;
 	if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0)
 		return true;   /* base resolved, give up on the rest */
@@ -415,9 +382,8 @@ bool akane_linker_discover(void)
 			}
 		}
 	}
-	/* DT_STRTAB/DT_SYMTAB may store either file-vaddrs (unbiased) or
-	 * runtime VAs depending on linker version; bionic stores runtime
-	 * VAs in soinfo, so prepare both candidates. */
+	/* DT_STRTAB/SYMTAB may be file-vaddrs or runtime VAs by linker version;
+	 * try both candidates. */
 	uint64_t biased_strtab = expected_strtab ? expected_strtab + expected_bias : 0;
 	uint64_t biased_symtab = expected_symtab ? expected_symtab + expected_bias : 0;
 
@@ -456,12 +422,8 @@ bool akane_linker_discover(void)
 		}
 	}
 
-	/* Step 6: discover the `next` pointer offset. solist's head soinfo
-	 * is a real entry; one of its qwords (excluding the offsets we've
-	 * already identified) is a pointer to ANOTHER valid soinfo. We
-	 * verify by chasing: the candidate must be readable, and reading
-	 * (candidate + base_offset) must give us another address whose
-	 * first 4 bytes are ELFMAG. */
+	/* Step 6: `next` offset = the head soinfo qword (not an already-known
+	 * offset) that points to another soinfo whose base is an ELFMAG mapping. */
 	uint64_t solist_head = st->solist_value;
 	if (solist_head && akl_addr_readable(solist_head) && st->offsets.base != AKANE_LINKER_OFF_NF) {
 		uint8_t head_buf[256];
@@ -483,7 +445,6 @@ bool akane_linker_discover(void)
 			if (!maybe_next || !akl_addr_readable(maybe_next))
 				continue;
 
-			/* Read what would be base_addr in the next entry. */
 			uint64_t next_base_addr = maybe_next + st->offsets.base;
 			if (!akl_addr_readable(next_base_addr))
 				continue;
@@ -505,9 +466,6 @@ bool akane_linker_discover(void)
 	return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* Public: register a payload in solist. */
-
 static inline void akl_set_qword(uint8_t *buf, uint16_t off, uint64_t v)
 {
 	if (off != AKANE_LINKER_OFF_NF)
@@ -527,21 +485,16 @@ bool akane_linker_register_payload(uint64_t base, uint64_t size,
 	    || !st->solist_addr)
 		return false;
 	if (g_akane_syn_active)
-		return false;   /* already registered, this version supports one */
+		return false;   /* one registration supported */
 
 	uint64_t old_head = st->solist_value;
 	if (!old_head || !akl_addr_readable(old_head))
 		return false;
 
-	/* Clone solist's head as template -- it's a real, well-formed
-	 * soinfo whose layout matches what bionic expects. Any field we
-	 * don't explicitly overwrite inherits a sane (libdl-ish) value. */
+	/* Clone solist's head as a template so unset fields inherit sane values. */
 	memcpy(g_akane_syn_soinfo, (const void *)(uintptr_t)old_head,
 	       sizeof(g_akane_syn_soinfo));
 
-	/* Copy name into our buffer; point the soinfo's strtab-adjacent
-	 * pointer fields at it later if needed. For now the path is just
-	 * stored locally so callers can find it via dl_iterate_phdr. */
 	if (name) {
 		size_t i = 0;
 		while (i < sizeof(g_akane_syn_name) - 1 && name[i]) {
@@ -553,19 +506,15 @@ bool akane_linker_register_payload(uint64_t base, uint64_t size,
 		g_akane_syn_name[0] = '\0';
 	}
 
-	/* Patch the fields the introspectors actually read. */
+	/* Patch the fields introspectors read. csoloader maps the first PT_LOAD
+	 * at the allocation start (p_vaddr 0), so load_bias == base. */
 	akl_set_qword(g_akane_syn_soinfo, st->offsets.base,  base);
 	akl_set_qword(g_akane_syn_soinfo, st->offsets.size,  size);
 	akl_set_qword(g_akane_syn_soinfo, st->offsets.phdr,  phdr);
 	akl_set_qword(g_akane_syn_soinfo, st->offsets.phnum, (uint64_t)phnum);
-	/* For our payload the gadget's first PT_LOAD has p_vaddr = 0, so
-	 * load_bias == base. (csoloader maps the first LOAD at the
-	 * allocation start without a vaddr offset.) */
 	akl_set_qword(g_akane_syn_soinfo, st->offsets.bias,  base);
 
-	/* Take dl_mutex around the splice if available. Bionic's own
-	 * dl_iterate_phdr / solist walkers take this same mutex, so a
-	 * concurrent reader will block until we publish the new head. */
+	/* Splice under dl_mutex (bionic's own solist walkers take it too). */
 	pthread_mutex_t *dlm = NULL;
 	if (st->dl_mutex_addr)
 		dlm = (pthread_mutex_t *)(uintptr_t)st->dl_mutex_addr;

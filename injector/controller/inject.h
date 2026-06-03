@@ -3,11 +3,7 @@
 
 #include "args.h"
 
-/* End-to-end injection. Assumes:
- *   - the kernel module is loaded (caller's responsibility)
- *   - args are validated
- *
- * Returns 0 on success, 1 on failure (errors already printed). */
+/* End-to-end injection (module must already be loaded). Returns 0 / 1. */
 int akane_inject(const struct akane_args *args);
 
 #endif /* AKANE_CTRL_INJECT_H */

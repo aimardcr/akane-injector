@@ -1,10 +1,7 @@
 #!/bin/sh
-# Build the akane-injector binary + libakane-runtime.so.
-#
-# Pre-step: scan out/module/*/akane.ko and generate, into out/injector/blobs/,
-# one .S file per available .ko (.incbin'ing it into the binary) plus a
-# module_blobs_table.c that lists the (label, android, kernel) tuple for
-# each. ndk-build picks all of those up via a generated sources.mk.
+# Build akane-injector + libakane-runtime.so. First embeds each built
+# out/module/*/akane.ko as a .incbin'd .S blob plus a module_blobs_table.c,
+# then runs ndk-build.
 set -e
 
 OUT="$1"

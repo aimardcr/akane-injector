@@ -1,19 +1,9 @@
 /*
- * akane maps: control what /proc/<pid>/maps shows for a target.
- *
- * A single kretprobe on show_map_vma fakes the permission column for two
- * sets of VMAs, without touching the real page-table protection so the
- * target keeps running:
- *
- *	per-VMA registry	VMAs we created via MEMORY_ALLOC. The per-handle
- *				HIDE_FROM_MEMORY flag (set via MAPS_SET_ATTRS)
- *				masks R/W/X for that line.
- *	per-mm flags		AKANE_PROC_HIDE_RWX_ANON masks every anon W+X
- *				mapping in the target's mm (Frida trampolines).
- *
- * The pre-handler clears vm_flags, the print code reads the faked flags,
- * the return-handler restores them. The same HIDE_FROM_MEMORY bit also
- * gates the introspection blocking in akane_hide.c.
+ * akane maps: fake the permission column in /proc/<pid>/maps for two sets of
+ * VMAs without touching page-table protection, so the target keeps running.
+ * A kretprobe on show_map_vma clears vm_flags in the pre-handler and restores
+ * them in the return-handler. Targets: VMAs flagged HIDE_FROM_MEMORY in the
+ * per-VMA registry, and (per-mm AKANE_PROC_HIDE_RWX_ANON) anon W+X mappings.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -30,11 +20,7 @@
 
 #include "akane.h"
 
-/*
- * vma->vm_flags became const in GKI 6.1+ (backported from upstream 6.3);
- * mutation has to go through the vm_flags_*() accessors. Earlier kernels
- * still allow direct assignment.
- */
+/* vm_flags became const in GKI 6.1+; mutation goes through vm_flags_*(). */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
 #define akane_vm_flags_clear(vma, flags) vm_flags_clear((vma), (flags))
 #define akane_vm_flags_reset(vma, flags) vm_flags_reset((vma), (flags))
@@ -44,7 +30,6 @@
 #endif
 
 /* Per-VMA mask registry. */
-
 struct akane_mask_entry {
 	struct list_head link;
 	void		*spec;		/* == &handle->spec; registry key */
@@ -136,9 +121,8 @@ bool akane_mask_addr_hidden_from_memory(struct mm_struct *mm,
 }
 
 /*
- * Per-mm process flags. The mm is stored raw (no mmgrab): the entry leaks
- * if the mm dies, which is harmless -- lookup compares pointers, so a stale
- * entry matches no live VMA's vm_mm. Module exit reclaims it.
+ * Per-mm process flags. The mm is stored raw (no mmgrab); a stale entry from
+ * a dead mm is harmless since lookup compares pointers. Module exit reclaims it.
  */
 struct akane_proc_entry {
 	struct list_head  link;
@@ -198,8 +182,7 @@ static void proc_set_flags(struct mm_struct *mm, u32 flags)
 	spin_unlock(&proc_lock);
 }
 
-/* kretprobe on show_map_vma (arm64: x0 = seq_file *, x1 = vm_area_struct *). */
-
+/* kretprobe on show_map_vma (arm64: x1 = vm_area_struct *). */
 struct mask_data {
 	struct vm_area_struct *vma;
 	unsigned long	       saved_flags;
@@ -256,8 +239,6 @@ static struct kretprobe show_map_kp = {
 	.maxactive     = 0,
 };
 
-/* ioctl: SET_ATTRS / SET_PROCESS_FLAGS. */
-
 long akane_maps_set_attrs_handle(unsigned long arg)
 {
 	struct akane_maps_set_attrs req;
@@ -313,8 +294,6 @@ long akane_maps_set_process_flags_handle(unsigned long arg)
 		req.pid, req.flags);
 	return 0;
 }
-
-/* Module-load init / unload teardown. */
 
 int akane_maps_init(void)
 {

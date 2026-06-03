@@ -1,8 +1,5 @@
-/*
- * akane core: module init/exit, the /dev/akane misc device, and ioctl
- * dispatch into the per-concern handlers. Also home to the few helpers
- * every concern shares (symbol resolution, task/mm lookup, prot mapping).
- */
+/* akane core: module init/exit, the /dev/akane misc device, ioctl dispatch,
+ * and helpers shared across concerns. */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -110,11 +107,7 @@ static long akane_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	return -ENOTTY;
 }
 
-/*
- * nonseekable_open() refuses seeks on every kernel we target; it replaces
- * the .llseek = no_llseek pattern that broke in 6.12 when no_llseek was
- * removed.
- */
+/* nonseekable_open() replaces the .llseek = no_llseek pattern dropped in 6.12. */
 static int akane_open(struct inode *inode, struct file *filp)
 {
 	return nonseekable_open(inode, filp);

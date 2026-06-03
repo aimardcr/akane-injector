@@ -1,22 +1,13 @@
 /*
- * akane memory: operations on a target process's address space.
+ * akane memory: alloc/free/detach + read/write/protect in a target mm.
  *
- *	ALLOC/FREE/DETACH	install, tear down, or orphan a
- *				vm_special_mapping owned by akane
- *	READ/WRITE		chunked transfer via access_process_vm()
- *	PROTECT			change protection on a range via mprotect_fixup()
+ * Each ALLOC owns a page array and vm_special_mapping, tracked live in the
+ * am_handles xarray or, after DETACH, on the am_detached list (mapping
+ * persists past controller exit).
  *
- * Each successful ALLOC owns its own page array and vm_special_mapping and
- * is tracked in an xarray so module exit can tear everything down. A handle
- * lives in one of two places:
- *
- *	am_handles	live: still owned by the controller
- *	am_detached	orphaned: mapping persists in the target after the
- *			controller exits (DETACH)
- *
- * We mmgrab() (not mmget()) the target mm: the struct stays valid for the
- * pointer comparisons in akane_memory_find_handle(), but the address space
- * is allowed to die. mmget_not_zero() at free time tells us whether it did.
+ * We mmgrab() (not mmget()) the target mm so the struct stays valid for the
+ * pointer comparisons in akane_memory_find_handle() while letting the address
+ * space die; mmget_not_zero() at free time tells us whether it did.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -75,11 +66,9 @@ typedef int (*access_process_vm_fn)(struct task_struct *tsk,
 				    unsigned int gup_flags);
 
 /*
- * mprotect_fixup is resolved via kallsyms, so the prototype must match the
- * target kernel exactly: 6.0 added the mmu_gather argument and 6.3 added the
- * vma_iterator ahead of it. Android GKI ships 5.10/5.15/6.1/6.6, so the 6.1
- * form (mmu_gather, no iterator) is a distinct case -- using the 6.6 seven-arg
- * form there shifts every argument and mprotect_fixup returns -EINVAL.
+ * Resolved via kallsyms, so the prototype must match the target kernel
+ * exactly: 6.0 added the mmu_gather arg, 6.3 added the vma_iterator ahead of
+ * it. A mismatch shifts every argument and mprotect_fixup returns -EINVAL.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 typedef int (*mprotect_fixup_fn)(struct vma_iterator *vmi,
@@ -166,18 +155,13 @@ call_mprotect_fixup(struct mm_struct *mm, struct vm_area_struct *vma,
 }
 
 /*
- * Forbid-split workaround. Newer kernels' special_mapping_vmops set
- * .may_split = special_mapping_split, which always returns -EINVAL, so PROTECT of
- * a sub-range fails: mprotect_fixup must split the VMA at the range boundary.
- * akane owns the mapping and its spec page array is pgoff-indexed, so the split
- * is safe here, give akane's VMAs a private vm_ops copy with may_split cleared.
- * The copy keeps every other hook (.fault/.name/...), so faulting, teardown and
- * the /proc/<pid>/maps name are unaffected; only mremap-time special-mapping
- * identity is lost, which a hidden payload never relies on. One copy shared by
- * every akane VMA, like the static vmops it is cloned from.
- *
- * The hook was named .split before ~5.11 and carried no veto on special
- * mappings, so on those kernels splitting already works and this is a no-op.
+ * Newer kernels set special_mapping_vmops.may_split = special_mapping_split,
+ * which returns -EINVAL and blocks sub-range PROTECT (mprotect_fixup must split
+ * the VMA). akane owns the mapping and its page array is pgoff-indexed, so the
+ * split is safe: give akane's VMAs a private vm_ops copy with may_split cleared.
+ * All other hooks are preserved; only mremap-time special-mapping identity is
+ * lost, which a hidden payload never relies on. Before ~5.11 the hook (.split)
+ * had no veto, so splitting already works there and this is a no-op.
  */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
 static struct vm_operations_struct akane_special_vmops;
@@ -200,15 +184,11 @@ static void akane_allow_vma_split(struct vm_area_struct *vma)
 #endif
 }
 
-/* Target-mm address-space search. */
-
 /*
  * Find an unmapped region of `len` bytes in `mm`. get_unmapped_area() works
- * against current->mm (the controller), not the target, so we walk the
- * target's own VMA list. Caller holds mmap_write_lock(mm).
- *
- * Linux 6.1 replaced the rb-tree + linked-list VMA storage with a maple
- * tree, dropping mm->mmap and vma->vm_next in favour of for_each_vma().
+ * on current->mm, not the target, so we walk the target's own VMA list.
+ * Caller holds mmap_write_lock(mm). 6.1 moved VMA storage to a maple tree,
+ * dropping mm->mmap/vma->vm_next in favour of for_each_vma().
  */
 static unsigned long am_find_unmapped(struct mm_struct *mm, unsigned long len)
 {
@@ -246,8 +226,6 @@ static bool am_range_is_free(struct mm_struct *mm,
 	return hint + len <= TASK_SIZE;
 }
 
-/* Handle lifecycle. */
-
 static struct am_handle *am_handle_new(unsigned int nr_pages)
 {
 	struct am_handle *h;
@@ -257,10 +235,7 @@ static struct am_handle *am_handle_new(unsigned int nr_pages)
 	if (!h)
 		return NULL;
 
-	/*
-	 * kvcalloc falls back to vmalloc once the array gets large
-	 * (65536 page pointers = 512 KiB).
-	 */
+	/* kvcalloc: array can reach 512 KiB (65536 page pointers). */
 	h->pages = kvcalloc(nr_pages + 1, sizeof(*h->pages), GFP_KERNEL);
 	if (!h->pages)
 		goto fail_pages_arr;
@@ -312,8 +287,6 @@ static void am_handle_destroy(struct am_handle *h)
 	}
 	am_handle_free(h);
 }
-
-/* ioctl: ALLOC. */
 
 static long am_create(pid_t pid, u32 prot, unsigned long size,
 		      unsigned long hint_addr,
@@ -388,11 +361,7 @@ static long am_create(pid_t pid, u32 prot, unsigned long size,
 
 	mmput(mm);
 
-	/*
-	 * New allocations are hidden by default; the controller exposes the
-	 * mapping (real perms + a name) via MAPS_SET_ATTRS once it knows which
-	 * one is the user's payload.
-	 */
+	/* Hidden by default; controller exposes it later via MAPS_SET_ATTRS. */
 	akane_mask_register(&h->spec, AKANE_MAPS_HIDE_FROM_MEMORY);
 
 	*out_addr = addr;
@@ -436,8 +405,6 @@ long akane_memory_alloc_handle(unsigned long arg)
 	return 0;
 }
 
-/* ioctl: FREE. */
-
 long akane_memory_free_handle(unsigned long arg)
 {
 	struct akane_memory_handle req;
@@ -459,8 +426,7 @@ long akane_memory_free_handle(unsigned long arg)
 	return 0;
 }
 
-/* ioctl: DETACH -- drop the kernel handle but leave the mapping in place. */
-
+/* DETACH: drop the kernel handle but leave the mapping in place. */
 long akane_memory_detach_handle(unsigned long arg)
 {
 	struct akane_memory_handle req;
@@ -485,12 +451,9 @@ long akane_memory_detach_handle(unsigned long arg)
 	return 0;
 }
 
-/* ioctl: READ / WRITE. */
-
 /*
- * Chunk through a kernel bounce buffer. A short transfer (done < len) is
- * not an error -- the target's mapping simply ran out -- and the ioctl
- * returns 0. -EFAULT only when zero bytes moved (bad addr / no permission).
+ * Chunk through a kernel bounce buffer. A short transfer (done < len) is not
+ * an error and returns 0; -EFAULT only when zero bytes moved.
  */
 static long am_rw(pid_t pid, unsigned long addr,
 		  void __user *ubuf, unsigned long len,
@@ -542,7 +505,7 @@ static long am_rw(pid_t pid, unsigned long addr,
 
 		done += moved;
 		if ((size_t)moved < chunk)
-			break;		/* short copy from access_process_vm */
+			break;
 	}
 
 	kfree(kbuf);
@@ -582,13 +545,9 @@ long akane_memory_write_handle(unsigned long arg)
 	return am_rw_handle(arg, true);
 }
 
-/* ioctl: PROTECT. */
-
 /*
- * Wrap mprotect_fixup() so it runs against an arbitrary mm. We require the
- * range to fit inside a single VMA, which is the common loader case (the
- * range came from one ALLOC, or one segment of a manually-mapped image).
- * mprotect_fixup() may still split the VMA at the [start, end) boundary.
+ * mprotect_fixup() against an arbitrary mm. The range must fit inside a single
+ * VMA (the common loader case); mprotect_fixup() may split it at the boundary.
  */
 static long am_protect(pid_t pid, unsigned int prot,
 		       unsigned long addr, unsigned long len)
@@ -701,11 +660,8 @@ int akane_memory_handle_set_name(struct am_handle *h,
 		new_name[len] = '\0';
 	}
 
-	/*
-	 * Clear spec.name before freeing the old backing so a concurrent
-	 * show_map_vma reader sees NULL rather than a half-freed pointer.
-	 * seq_puts copies the bytes immediately, so no RCU is needed.
-	 */
+	/* Clear spec.name before freeing so a concurrent show_map_vma reader
+	 * sees NULL, not a half-freed pointer. */
 	h->spec.name = NULL;
 	if (h->name) {
 		kfree(h->name);
@@ -722,8 +678,6 @@ void *akane_memory_handle_spec(struct am_handle *h)
 {
 	return &h->spec;
 }
-
-/* Module-load init / unload teardown. */
 
 int akane_memory_init(void)
 {
@@ -743,11 +697,7 @@ int akane_memory_init(void)
 	}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-	/*
-	 * tlb_gather_mmu/tlb_finish_mmu exist in kallsyms but aren't
-	 * EXPORT_SYMBOL'd on every kernel, so resolve them too rather than
-	 * link directly (a direct reference fails insmod with -ENOENT).
-	 */
+	/* Not EXPORT_SYMBOL'd on every kernel; resolve rather than link. */
 	tlb_gather_mmu_p = (tlb_gather_mmu_fn)
 		akane_kallsyms_lookup("tlb_gather_mmu");
 	tlb_finish_mmu_p = (tlb_finish_mmu_fn)

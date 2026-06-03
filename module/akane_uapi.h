@@ -1,17 +1,5 @@
-/*
- * akane UAPI -- the ioctl ABI shared between the kernel module and the
- * userspace injector.
- *
- * Three feature bands plus one standalone primitive, each in its own ioctl
- * range so a band can grow without colliding with the next:
- *
- *	AKANE_MEMORY	0x10..0x2F	alloc/free/detach + read/write/protect
- *	AKANE_MAPS	0x30..0x3F	/proc/<pid>/maps visibility
- *	AKANE_HIDE	0x40..0x4F	hide paths / modules / ports
- *	AKANE_TASK_WORK	0x70..0x7F	redirect a target thread
- *
- * pid == 0 means "the caller" everywhere.
- */
+/* akane ioctl ABI, shared between the module and the userspace injector.
+ * pid == 0 means the caller everywhere. */
 #ifndef _AKANE_UAPI_H
 #define _AKANE_UAPI_H
 
@@ -20,16 +8,7 @@
 
 #define AKANE_IOC_MAGIC  'A'
 
-/* ====================================================================
- * AKANE_MEMORY -- target-process memory operations.
- *
- *	ALLOC		install a vm_special_mapping in the target's mm;
- *			return (addr, handle)
- *	FREE		munmap the VMA in the target + drop the handle
- *	DETACH		drop the handle without munmap (mapping persists)
- *	READ/WRITE	chunked transfer via access_process_vm
- *	PROTECT		mprotect_fixup against the target's mm
- * ==================================================================== */
+/* AKANE_MEMORY -- target-process memory operations. */
 
 #define AKANE_PROT_READ  0x1
 #define AKANE_PROT_WRITE 0x2
@@ -72,28 +51,12 @@ struct akane_memory_protect {
 #define AKANE_IOC_MEMORY_WRITE   _IOWR(AKANE_IOC_MAGIC, 0x21, struct akane_memory_io)
 #define AKANE_IOC_MEMORY_PROTECT _IOW (AKANE_IOC_MAGIC, 0x22, struct akane_memory_protect)
 
-/* ====================================================================
- * AKANE_MAPS -- visibility of a target's /proc/<pid>/maps and friends.
- *
- *	SET_ATTRS		attach a name + visibility flags to an akane
- *				allocation, located by (pid, addr-in-it)
- *	SET_PROCESS_FLAGS	per-mm filters not tied to a specific VMA
- * ==================================================================== */
+/* AKANE_MAPS -- visibility of a target's /proc/<pid>/maps and friends. */
 
-/*
- * Per-VMA visibility carried in akane_maps_set_attrs.flags.
- *
- *   HIDE_FROM_MEMORY  Mask the VMA's perms to ---p in /proc/<pid>/maps (the
- *                     page-table perms are untouched, so the target keeps
- *                     running) and block non-root introspection of it via
- *                     /proc/<pid>/{mem,smaps,pagemap}, process_vm_readv/writev
- *                     and mincore. Every hook bails on root callers, so the
- *                     controller and any root tool still see everything.
- *
- * With the flag clear (flags == 0) the mapping shows its real perms plus the
- * given name, disguising it as a legit file-backed library. New allocations
- * default to HIDE_FROM_MEMORY until the controller decides otherwise.
- */
+/* Mask the VMA to ---p in maps and block non-root introspection via
+ * /proc/<pid>/{mem,smaps,pagemap}, process_vm_readv/writev and mincore.
+ * Page-table perms are untouched, so the target keeps running. Flag clear
+ * shows real perms + name. New allocations default to this flag set. */
 #define AKANE_MAPS_HIDE_FROM_MEMORY  0x1
 
 struct akane_maps_set_attrs {
@@ -110,11 +73,8 @@ struct akane_maps_set_process_flags {
 	__u32 flags;      /* AKANE_PROC_* mask. Replaces existing flags. */
 };
 
-/*
- * Mask every anonymous mapping with both VM_WRITE and VM_EXEC to ---p in
- * /proc/<pid>/maps. Page-table protection is unchanged, so JIT / codegen
- * pages keep working in the target.
- */
+/* Mask every WX anonymous mapping to ---p in maps; page-table perms
+ * unchanged, so JIT / codegen pages keep working. */
 #define AKANE_PROC_HIDE_RWX_ANON  0x1
 
 #define AKANE_IOC_MAPS_SET_ATTRS \
@@ -122,19 +82,8 @@ struct akane_maps_set_process_flags {
 #define AKANE_IOC_MAPS_SET_PROCESS_FLAGS \
 	_IOW(AKANE_IOC_MAGIC, 0x31, struct akane_maps_set_process_flags)
 
-/* ====================================================================
- * AKANE_HIDE -- hide things from non-root listings/lookups.
- *
- *	PATH		open()/stat()/access()/readlink() return -ENOENT;
- *			matched exact OR as a directory prefix
- *	MODULE		filtered out of /proc/modules and getdents64
- *	TCP_PORT	drop matching lines from /proc/net/tcp{,6}
- *	UDP_PORT	drop matching lines from /proc/net/udp{,6}
- *
- * All hooks short-circuit for root. /dev/akane, /sys/module/akane and the
- * "akane" module name are registered at init, so akane is invisible to
- * non-root callers out of the box.
- * ==================================================================== */
+/* AKANE_HIDE -- hide paths/modules/ports from non-root listings/lookups.
+ * All hooks short-circuit for root. */
 
 #define AKANE_HIDE_KIND_PATH      0
 #define AKANE_HIDE_KIND_MODULE    1
@@ -152,15 +101,9 @@ struct akane_hide_target {
 #define AKANE_IOC_HIDE_ADD     _IOW(AKANE_IOC_MAGIC, 0x40, struct akane_hide_target)
 #define AKANE_IOC_HIDE_REMOVE  _IOW(AKANE_IOC_MAGIC, 0x41, struct akane_hide_target)
 
-/* ====================================================================
- * AKANE_TASK_WORK -- queue a task_work callback in a target thread.
- *
- * On the thread's next return-to-userspace the callback optionally snapshots
- * pt_regs to a buffer in the target's mm, then sets x0 = arg0 and pc = pc.
- * The kernel knows nothing about bootstrap layout or init_array -- those are
- * entirely between the caller and whatever code lives at `pc`. Traceless: no
- * userspace artifacts, no signal.
- * ==================================================================== */
+/* AKANE_TASK_WORK -- queue a task_work callback in a target thread. On its
+ * next return-to-userspace the callback optionally snapshots pt_regs, then
+ * sets x0 = arg0 and pc = pc. No userspace artifacts, no signal. */
 
 struct akane_task_work {
 	__s32 pid;

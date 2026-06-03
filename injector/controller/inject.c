@@ -33,9 +33,7 @@ struct boot_region {
 	uint64_t handle;
 };
 
-/* Read argv[0] from /proc/<pid>/cmdline. Args are NUL-separated; we
- * stop at the first NUL the read returns, which is the end of argv[0].
- * For Android apps that's the full package name (com.foo.bar). */
+/* Read argv[0] from /proc/<pid>/cmdline (the package name on Android). */
 static int read_cmdline(pid_t pid, char *out, size_t cap)
 {
 	char path[64];
@@ -45,19 +43,14 @@ static int read_cmdline(pid_t pid, char *out, size_t cap)
 	ssize_t n = read(fd, out, cap - 1);
 	close(fd);
 	if (n <= 0) return -1;
-	out[n] = '\0';   /* defensive; first NUL from cmdline already terminates argv[0] */
+	out[n] = '\0';
 	return 0;
 }
 
-/* Zero a target-side range that may sit in a non-writable segment, then
- * restore the page's protection to `restore_prot`. Page-aligns the range,
- * flips each covering page to RW, writes zeros, restores. Best-effort:
- * any ioctl failure is logged and skipped -- partial wipes are not a
- * correctness problem, just less stealth.
- *
- * `restore_prot` must match the wiped page's original segment perms
- * (R|X for content in PF_R|PF_X PT_LOAD, R for PF_R-only). All current
- * callers wipe content in the first PT_LOAD (RX) of a typical Android .so. */
+/* Zero a target-side range that may be non-writable: page-align, flip each
+ * page to RW, write zeros, restore. Best-effort; failures are logged.
+ * `restore_prot` must match the wiped pages' original segment perms (RX for
+ * all current callers, which wipe the first PT_LOAD of an Android .so). */
 static void wipe_target_range(int akane_fd, pid_t target_pid,
                               uint64_t addr, uint64_t size,
                               uint32_t restore_prot, const char *what)
@@ -79,9 +72,7 @@ static void wipe_target_range(int akane_fd, pid_t target_pid,
 		return;
 	}
 
-	/* Stream zeros in PAGE_SIZE chunks so we don't oversize a single
-	 * mem_write. The size involved here is small (.dynstr a few KiB,
-	 * build-id ~36 bytes, ELF header 64 bytes) but the loop costs nothing. */
+	/* Stream zeros in PAGE_SIZE chunks. */
 	static const unsigned char zeros[4096] = { 0 };
 	uint64_t off = 0;
 	while (off < size) {
@@ -115,21 +106,13 @@ static void wipe_target_range(int akane_fd, pid_t target_pid,
 }
 
 enum elf_strip_phase {
-	/* Before constructors fire: ELF header only. Unconditional -- cheap
-	 * basic stealth against \x7fELF-magic memory scans. Safe because
-	 * bionic + the payload never re-read their own ELF header at runtime. */
+	/* Pre-init: ELF header only. Unconditional; defeats \x7fELF magic scans. */
 	ELF_STRIP_PRE_INIT,
-	/* After constructors fire: .dynstr + .note.gnu.build-id. Gated on
-	 * --hide-from-memory. Both are YARA-signature targets and unused after
-	 * relocation + init. Libraries that re-introspect themselves AFTER
-	 * init (Frida gadget re-walking its own PT_DYNAMIC for symbol lookups)
-	 * will get empty strings -- that's the documented cost. */
+	/* Post-init: .dynstr + .note.gnu.build-id (YARA targets). Gated on
+	 * --hide-from-memory; payloads that re-introspect after init see empty. */
 	ELF_STRIP_POST_INIT,
 };
 
-/* Single entry point for all post-load ELF-metadata wipes. Dispatches by
- * phase to keep timing-sensitive ordering (pre/post init_array) explicit
- * at call sites without duplicating the protect/write/protect dance. */
 static void strip_elf_metadata(int akane_fd, pid_t target_pid,
                                const struct akane_payload_info *pl,
                                enum elf_strip_phase phase)
@@ -152,8 +135,7 @@ static void strip_elf_metadata(int akane_fd, pid_t target_pid,
 	}
 }
 
-/* Allocate target-side boot region, mem_write the bootstrap blob, set
- * RX on the code page. Returns 0 + base/handle on success. */
+/* Allocate the target-side boot region, write the bootstrap blob, RX the code page. */
 static int setup_boot_region(int akane_fd, pid_t target_pid,
                              struct boot_region *out)
 {
@@ -207,16 +189,10 @@ static int setup_boot_region(int akane_fd, pid_t target_pid,
 	return 0;
 }
 
-/* Set per-mapping visibility. akane allocations are hidden by default --
- * perms masked to ---p in /proc/<pid>/maps, and blocked from
- * /proc/<pid>/{mem,smaps,pagemap} + cross-process readv/writev + mincore
- * for non-root callers -- so the runtime and bootstrap regions need no
- * explicit override.
- *
- * The payload is the one mapping we expose by default: it shows real perms
- * and the .so path, disguised as a legit file-backed library, which is what
- * self-introspecting payloads (Frida gadget) expect. --hide-from-memory
- * instead leaves the payload hidden like everything else. */
+/* akane allocations are hidden by default, so the runtime/bootstrap regions
+ * need no override. The payload is exposed by default (real perms + .so path,
+ * as self-introspecting payloads like the Frida gadget expect);
+ * --hide-from-memory leaves it hidden like the rest. */
 static void apply_visibility(int akane_fd, pid_t target_pid,
                              uint64_t payload_base,
                              const char *so_path, int hide_from_memory)
@@ -240,10 +216,8 @@ static void apply_visibility(int akane_fd, pid_t target_pid,
 	}
 }
 
-/* Redirect each of the payload's dl* GOT slots to the corresponding
- * runtime library hook. The GOT page is RO post-RELRO; flip to RW,
- * write, flip back. Iterates a uniform (name, got, hook) table so
- * the per-slot logic only lives in one place. */
+/* Redirect the payload's dl* GOT slots to the runtime hooks. The GOT page is
+ * RO post-RELRO, so flip to RW, write, flip back. */
 static void patch_got_slots(int akane_fd, pid_t target_pid,
                             const struct akane_payload_info *pl,
                             const struct akane_runtime_info *rt)
@@ -296,10 +270,8 @@ static void patch_got_slots(int akane_fd, pid_t target_pid,
 	DETAIL("hooks: %d/%zu planted", patched, n);
 }
 
-/* Register the payload in the runtime library's globals. The .data
- * segment hosting these globals is already RW (BSS isn't RELRO'd),
- * so we mem_write directly. Slot 0 since each invocation gets its
- * own freshly-injected runtime instance. */
+/* Register the payload in the runtime's globals (slot 0; each invocation gets
+ * a fresh runtime instance). Their .data is RW, so we mem_write directly. */
 static void write_payload_registry(int akane_fd, pid_t target_pid,
                                    const struct akane_payload_info *pl,
                                    const struct akane_runtime_info *rt,
@@ -341,10 +313,9 @@ static void write_payload_registry(int akane_fd, pid_t target_pid,
 	DETAIL("registered as payload[0]");
 }
 
-/* Plant the runtime function's target VA at saved_state+424 so
- * akane_init_runner calls it before iterating init_array. saved_state+424
- * sits past the init_info triple (+384..+408) and the tid storage slot
- * (+408, +416 padding) so there's no overlap. */
+/* Plant the runtime function's VA at saved_state+424 so akane_init_runner
+ * calls it before iterating init_array (+424 clears the init_info triple at
+ * +384..+408 and the tid slot at +408..+416). */
 static void arm_linker_register(int akane_fd, pid_t target_pid,
                                 const struct boot_region *boot,
                                 uint64_t linker_register_fn)
@@ -365,11 +336,9 @@ static void arm_linker_register(int akane_fd, pid_t target_pid,
 		    strerror(errno));
 }
 
-/* Plant the (init_array_addr, init_array_count, pthread_create_addr)
- * triple at saved_state+384 -- the contract bootstrap.S reads when
- * the hijacked thread enters. The kernel's task_work primitive only
- * writes pt_regs at +0; everything else in the saved_state buffer
- * is the injector/bootstrap's contract. */
+/* Plant the (init_array_addr, count, pthread_create_addr) triple at
+ * saved_state+384 -- the contract bootstrap.S reads on entry. The kernel
+ * writes pt_regs only at +0; the rest of the buffer is ours. */
 static int plant_init_info(int akane_fd, pid_t target_pid,
                            const struct boot_region *boot,
                            const struct akane_payload_info *pl)
@@ -410,8 +379,7 @@ static int submit_task_work(int akane_fd, pid_t target_pid,
 	return 0;
 }
 
-/* Poll the bootstrap's done flag at saved_state+512 so we can report
- * whether the hijacked thread reached the resume path. */
+/* Poll the bootstrap's done flag at saved_state+512 (5s timeout). */
 static uint8_t wait_for_done_flag(int akane_fd, pid_t target_pid,
                                   const struct boot_region *boot)
 {
@@ -426,25 +394,21 @@ static uint8_t wait_for_done_flag(int akane_fd, pid_t target_pid,
 		};
 		if (ioctl(akane_fd, AKANE_IOC_MEMORY_READ, &rio) == 0 && flag)
 			break;
-		usleep(100000);   /* 100ms x 50 = 5s timeout */
+		usleep(100000);
 	}
 	return flag;
 }
 
-/* Always *detach* the boot region rather than free it: the worker thread
- * spawned by the bootstrap reads from saved_state and executes init_runner
- * from this same blob, so the mapping must outlive the controller. The
- * 8 KiB anon mapping persists until the target exits. */
+/* Detach rather than free: the bootstrap's worker thread keeps running
+ * init_runner from this blob, so the mapping must outlive the controller. */
 static void detach_boot(int akane_fd, const struct boot_region *boot)
 {
 	struct akane_memory_handle dt = { .handle = boot->handle };
 	ioctl(akane_fd, AKANE_IOC_MEMORY_DETACH, &dt);
 }
 
-/* Diagnostic: tells us whether the payload actually invoked our dl*
- * hooks, or whether it bypassed them entirely (e.g. by reading
- * /proc/self/maps directly). Tries multiple short reads so we catch
- * the counters before the crash reaps the target. */
+/* Diagnostic: did the payload invoke our dl* hooks? Retries so we catch the
+ * counters before the target is reaped. */
 static void log_hook_call_counts(int akane_fd, pid_t target_pid,
                                  uint64_t call_counts_addr)
 {
@@ -456,7 +420,7 @@ static void log_hook_call_counts(int akane_fd, pid_t target_pid,
 	uint64_t cc[6] = {0};
 	int read_ok = 0;
 	for (int i = 0; i < 20; i++) {
-		usleep(50000);   /* 50ms x 20 = 1s window */
+		usleep(50000);   /* 1s window */
 		struct akane_memory_io rio = {
 			.pid  = target_pid,
 			.addr = call_counts_addr,
@@ -478,9 +442,7 @@ static void log_hook_call_counts(int akane_fd, pid_t target_pid,
 		DETAIL("hook calls: mem_read failed (%s)", strerror(errno));
 }
 
-/* Mirror of struct akane_linker_state's prefix (we only need the scalar
- * fields + somain_buf for now; a full mirror is unnecessary since we
- * control the layout on both sides). */
+/* Mirror of struct akane_linker_state's prefix (layout controlled on both sides). */
 struct linker_state_mirror {
 	uint32_t version;
 	uint32_t flags;
@@ -543,8 +505,6 @@ static void log_linker_state(int akane_fd, pid_t target_pid,
 	       ls.offsets.bias, ls.offsets.strsz,
 	       ls.offsets.next);
 	if (ls.offsets.base != 0xFFFF) {
-		/* Hex-dump the first 128 bytes of somain's soinfo so we
-		 * can eyeball the structure. */
 		DETAIL("  somain soinfo (first 128 bytes):");
 		for (size_t row = 0; row < 128; row += 16) {
 			uint64_t a, b;
@@ -572,8 +532,7 @@ int akane_inject(const struct akane_args *args)
 	else
 		INFO("loading %s into pid %d", args->so_path, args->target_pid);
 
-	/* Load the runtime first. Its hook + registry addresses are needed
-	 * for the payload's GOT patch and the registry write. */
+	/* Runtime first: its addresses feed the payload's GOT patch and registry. */
 	struct akane_runtime_info rt;
 	if (akane_runtime_load(&backend, &rt) != 0) {
 		akane_backend_deinit(&backend);
@@ -632,10 +591,8 @@ int akane_inject(const struct akane_args *args)
 	else
 		DETAIL("bootstrap detached (no completion flag -- hijack may have stalled)");
 
-	/* Post-init strip runs after the done flag so that .init_array can
-	 * still read .dynstr / build-id during its own self-init. If the
-	 * hijack stalled we skip -- the constructors may not have run yet,
-	 * and a premature strip could trip them up. */
+	/* Post-init strip waits for the done flag: .init_array may read .dynstr /
+	 * build-id during self-init, and a premature strip could break it. */
 	if (args->hide_from_memory && flag)
 		strip_elf_metadata(backend.akane_fd, args->target_pid, &pl,
 		                   ELF_STRIP_POST_INIT);

@@ -7,8 +7,7 @@
 #define RUNTIME_LIB_PATH  "/data/local/tmp/libakane-runtime.so"
 #define AKANE_RT_NAME_LEN 256
 
-/* Mirror of struct akane_rt_payload in runtime/runtime.c. The controller
- * writes one of these into g_akane_rt_payloads[count] before exec. */
+/* Mirror of struct akane_rt_payload; written into g_akane_rt_payloads. */
 struct akane_rt_payload_entry {
 	uint64_t base;
 	uint64_t size;
@@ -18,9 +17,7 @@ struct akane_rt_payload_entry {
 	uint32_t _pad1;
 };
 
-/* Symbol/address bundle extracted from the runtime library after load.
- * Zero-valued fields mean "symbol not present" (older runtime build);
- * the orchestrator decides whether each is required. */
+/* Addresses resolved from the runtime library; 0 = symbol not present. */
 struct akane_runtime_info {
 	uint64_t base;
 	uint64_t hook_dl_iterate_phdr;
@@ -37,9 +34,7 @@ struct akane_runtime_info {
 	uint64_t linker_state_addr;
 };
 
-/* Load libakane-runtime.so into the target via CSOLoader, resolve the
- * hook + registry symbols, and abandon the loader handle. Returns 0 on
- * success; on failure, prints an error and returns -1. */
+/* Load libakane-runtime.so into the target and resolve its symbols. */
 int akane_runtime_load(struct akane_backend *backend,
                        struct akane_runtime_info *out);
 

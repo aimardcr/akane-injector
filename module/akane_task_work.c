@@ -1,13 +1,8 @@
 /*
- * akane task_work: redirect a thread of a target process to an arbitrary PC.
- *
- * A generic primitive: the kernel knows nothing about init_array, bootstrap
- * layout, or any userspace convention. It queues a task_work callback that,
- * on the target thread's next return-to-userspace, optionally snapshots
- * pt_regs to the target's mm, then sets x0 = arg0 and pc = pc. Everything
- * past the jump is the caller's contract with whatever lives at `pc`.
- *
- * Traceless: no userspace artifacts, no syscall-pattern change, no signal.
+ * akane task_work: redirect a target thread to an arbitrary PC. Queues a
+ * task_work callback that, on the thread's next return-to-userspace,
+ * optionally snapshots pt_regs to the target's mm, then sets x0 = arg0 and
+ * pc = pc. No userspace artifacts, no signal.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -46,10 +41,7 @@ static void akane_tw_callback(struct callback_head *cb)
 	struct akane_tw_work *w = container_of(cb, struct akane_tw_work, head);
 	struct pt_regs *regs = task_pt_regs(current);
 
-	/*
-	 * We run in the target task's context, so current->mm is the
-	 * target's mm and copy_to_user writes into its address space.
-	 */
+	/* Runs in the target's context, so copy_to_user hits its address space. */
 	if (w->saved_state_addr) {
 		if (copy_to_user((void __user *)w->saved_state_addr,
 				 regs, sizeof(*regs)) != 0) {
@@ -96,10 +88,7 @@ long akane_task_work_handle(unsigned long arg)
 	w->arg0		    = (unsigned long)req.arg0;
 	w->saved_state_addr = (unsigned long)req.saved_state_addr;
 
-	/*
-	 * TWA_SIGNAL kicks the thread awake even if it's blocked in a
-	 * sleeping syscall, so the callback fires promptly.
-	 */
+	/* TWA_SIGNAL wakes a thread blocked in a sleeping syscall. */
 	ret = call_task_work_add(task, &w->head, TWA_SIGNAL);
 	put_task_struct(task);
 	if (ret) {

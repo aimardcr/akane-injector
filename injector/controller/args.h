@@ -13,11 +13,7 @@ struct akane_args {
 
 void akane_args_usage(void);
 
-/* Returns:
- *   0  on success (out fully populated)
- *   2  on bad args (usage already printed to stderr)
- *   1  on early-exit success (--help; caller should return 0)
- */
+/* Returns 0 on success, 1 on --help (caller returns 0), 2 on bad args. */
 int akane_args_parse(int argc, char **argv, struct akane_args *out);
 
 #endif /* AKANE_CTRL_ARGS_H */
